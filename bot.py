@@ -1,72 +1,78 @@
 import asyncio
+import logging
 import os
-import re
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import urlsplit
 
-from telethon import TelegramClient, connection, events
-from telethon.sessions import MemorySession
+from aiogram import Bot, Dispatcher, F
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.types import Message
 
 
 def required_env(name):
     value = os.getenv(name, "").strip()
     if not value:
-        raise SystemExit(f"Заполните переменную {name}")
+        raise SystemExit(f"Заполните переменную окружения {name}")
     return value
 
 
-def parse_proxy(link):
+def get_proxy_url():
+    value = required_env("PROXY_URL")
     try:
-        url = urlsplit(link)
-        if url.scheme != "tg" or url.netloc != "proxy":
+        parsed = urlsplit(value)
+        if parsed.scheme not in {"http", "socks5"}:
             raise ValueError
-
-        params = parse_qs(url.query)
-        host, = params["server"]
-        port_text, = params["port"]
-        secret, = params["secret"]
-        port = int(port_text)
-
-        if not 1 <= port <= 65535:
+        if not parsed.hostname or parsed.port is None:
             raise ValueError
-        if not re.fullmatch(r"(?:dd)?[0-9a-f]{32}", secret, re.IGNORECASE):
+        if not 1 <= parsed.port <= 65535:
             raise ValueError
-    except (KeyError, ValueError):
+        if parsed.path not in {"", "/"} or parsed.query or parsed.fragment:
+            raise ValueError
+    except ValueError:
         raise SystemExit(
-            "TG_PROXY_URL: нужна полная ссылка tg://proxy с HEX-секретом "
-            "из 32 символов, опционально с префиксом dd."
+            "PROXY_URL должен иметь формат http://host:port "
+            "или socks5://host:port. "
+            "Для авторизации используйте protocol://user:password@host:port."
         ) from None
-
-    return host, port, secret.lower()
+    return value
 
 
 async def main():
     token = required_env("BOT_TOKEN")
-    proxy = parse_proxy(required_env("TG_PROXY_URL"))
-    try:
-        api_id = int(required_env("TG_API_ID"))
-    except ValueError:
-        raise SystemExit("TG_API_ID должен быть числом") from None
+    proxy_url = get_proxy_url()
 
-    client = TelegramClient(
-        MemorySession(),
-        api_id,
-        required_env("TG_API_HASH"),
-        connection=connection.ConnectionTcpMTProxyRandomizedIntermediate,
-        proxy=proxy,
-    )
+    session = AiohttpSession(proxy=proxy_url)
+    bot = Bot(token=token, session=session)
+    dispatcher = Dispatcher()
 
-    @client.on(events.NewMessage(incoming=True))
-    async def reply(event):
-        if event.is_private:
-            await event.reply("Бот работает")
+    @dispatcher.message(F.chat.type == "private")
+    async def reply(message: Message):
+        await message.answer("Бот работает")
 
     try:
-        await client.start(bot_token=token)
-        print("Бот подключён и ждёт сообщений в личном чате.", flush=True)
-        await client.run_until_disconnected()
+        webhook = await bot.get_webhook_info()
+        if webhook.url:
+            raise SystemExit(
+                "У бота настроен Telegram webhook. "
+                "Согласуйте отключение webhook с владельцем текущей интеграции "
+                "или используйте отдельного тестового бота."
+            )
+
+        logging.info(
+            "Подключение через прокси установлено. "
+            "Запускается опрос сообщений."
+        )
+        await dispatcher.start_polling(
+            bot,
+            allowed_updates=["message"],
+            close_bot_session=False,
+        )
     finally:
-        await client.disconnect()
+        await session.close()
 
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
     asyncio.run(main())
